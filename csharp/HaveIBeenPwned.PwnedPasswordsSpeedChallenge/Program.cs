@@ -294,16 +294,16 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
         string prefixFile = Path.Combine(_cacheDir, $"{Convert.ToHexString(hash.Span[..3])[..5]}.txt");
 
-        try
+        using (await AsyncDuplicateLock.LockAsync(string.Intern(prefixFile)).ConfigureAwait(false))
         {
-            using (await AsyncDuplicateLock.LockAsync(string.Intern(prefixFile)).ConfigureAwait(false))
+            try
             {
                 using SafeFileHandle? handle = File.OpenHandle(prefixFile, FileMode.Open, FileAccess.Read, FileShare.Read, FileOptions.SequentialScan | FileOptions.Asynchronous);
                 int numEntries = (int)RandomAccess.GetLength(handle) / 22;
                 byte[] tempArray = ArrayPool<byte>.Shared.Rent(numEntries * 22);
                 Memory<byte> tempMemory = tempArray.AsMemory(0, numEntries * 22);
                 ValueTask<int> readTask = RandomAccess.ReadAsync(handle, tempMemory, 0);
-                if(!readTask.IsCompletedSuccessfully)
+                if (!readTask.IsCompletedSuccessfully)
                 {
                     await readTask.ConfigureAwait(false);
                 }
@@ -319,12 +319,9 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
                 ArrayPool<byte>.Shared.Return(tempArray);
             }
-        }
-        catch (FileNotFoundException)
-        {
-            await GetPwnedPasswordsRangeFromWeb(hash, entries).ConfigureAwait(false);
-            using (await AsyncDuplicateLock.LockAsync(string.Intern(prefixFile)).ConfigureAwait(false))
+            catch (FileNotFoundException)
             {
+                await GetPwnedPasswordsRangeFromWeb(hash, entries).ConfigureAwait(false);
                 int totalBytes = entries.Count * 22;
                 using SafeFileHandle handle = File.OpenHandle(prefixFile, FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous, totalBytes);
                 byte[] tempArray = ArrayPool<byte>.Shared.Rent(totalBytes);
@@ -336,7 +333,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
                 }
 
                 ValueTask writeTask = RandomAccess.WriteAsync(handle, tempMemory, 0);
-                if(!writeTask.IsCompletedSuccessfully)
+                if (!writeTask.IsCompletedSuccessfully)
                 {
                     await writeTask.ConfigureAwait(false);
                 }
