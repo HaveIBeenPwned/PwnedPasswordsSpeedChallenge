@@ -3,6 +3,7 @@
 
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -44,14 +45,11 @@ namespace HaveIBeenPwned.PwnedPasswordsSpeedChallenge
             return false;
         }
 
-        internal static void GetSha1Hash(this string password, Memory<byte> hashBytes)
+        [SkipLocalsInit]
+        internal unsafe static void GetSha1Hash(this string password, Memory<byte> hashBytes)
         {
-            int numBytesRequired = s_encoding.GetByteCount(password);
-            byte[] array = ArrayPool<byte>.Shared.Rent(numBytesRequired);
-            Span<byte> stringBytes = array.AsSpan(0, numBytesRequired);
-            s_encoding.GetBytes(password, stringBytes);
-            SHA1.TryHashData(stringBytes, hashBytes.Span, out _);
-            ArrayPool<byte>.Shared.Return(array);
+            Span<byte> workSpan = stackalloc byte[1024];
+            SHA1.HashData(workSpan.Slice(0, s_encoding.GetBytes(password, workSpan)), hashBytes.Span);
         }
 
         internal static int CountLines(string inputFile)
