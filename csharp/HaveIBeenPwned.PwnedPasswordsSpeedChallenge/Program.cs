@@ -92,7 +92,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
             settings.Parallelism = Environment.ProcessorCount;
         }
 
-        _passwords = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
+        _passwords = Channel.CreateBounded<string>(new BoundedChannelOptions(settings.Parallelism * 16) { SingleReader = false, SingleWriter = true });
         _results = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
         InitializeCache(settings);
@@ -155,7 +155,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
             });
 
         processingTask.Wait();
-        AnsiConsole.MarkupLine($"Finished processing {_statistics.NumPasswords:N0} passwords in {_statistics.ElapsedMilliseconds:N0}ms ({_statistics.PasswordsPerSec:N2} passwords per second).");
+        AnsiConsole.MarkupLine($"Finished checking {_statistics.NumPasswords:N0} passwords in {_statistics.ElapsedMilliseconds:N0}ms ({_statistics.PasswordsPerSec:N2} passwords per second). We found {_statistics.PwnedPasswords:N0} pwned passwords ({_statistics.PwnedPasswordsPercentage:N2}%).");
         AnsiConsole.MarkupLine($"We made {_statistics.CloudflareRequests:N0} Cloudflare requests (avg response time: {(double)_statistics.CloudflareRequestTimeTotal / _statistics.CloudflareRequests:N2}ms). Of those, Cloudflare had already cached {_statistics.CloudflareHits:N0} requests, and made {_statistics.CloudflareMisses:N0} requests to the HaveIBeenPwned origin server.");
 
         return 0;
@@ -292,9 +292,10 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
             return await GetPwnedPasswordsRangeFromWeb(hash, entries).ConfigureAwait(false);
         }
 
-        string prefixFile = Path.Combine(_cacheDir, $"{Convert.ToHexString(hash.Span[..3])[..5]}.txt");
+        string prefix = Convert.ToHexString(hash.Span[..3])[..5];
+        string prefixFile = Path.Combine(_cacheDir, $"{prefix}.txt");
 
-        using (await AsyncDuplicateLock.LockAsync(string.Intern(prefixFile)).ConfigureAwait(false))
+        using (await AsyncDuplicateLock.LockAsync(string.Intern(prefix)).ConfigureAwait(false))
         {
             try
             {
@@ -338,6 +339,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
                     await writeTask.ConfigureAwait(false);
                 }
 
+
                 ArrayPool<byte>.Shared.Return(tempArray);
             }
         }
@@ -372,16 +374,15 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
     private List<HashEntry> GetHashList()
     {
-        if (_hashEntries.TryPop(out List<HashEntry> items))
+        if (_hashEntries.TryPop(out List<HashEntry>? items) && items != null)
         {
             items.Clear();
+            return items;
         }
         else
         {
-            items = new List<HashEntry>();
+            return new List<HashEntry>();
         }
-
-        return items;
     }
 
     private static async Task<List<HashEntry>> ParseHibpEntriesAsync(char firstChar, Stream stream, List<HashEntry> entries)
@@ -424,11 +425,14 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
             {
                 if (!string.IsNullOrWhiteSpace(line))
                 {
-                    _passwords.Writer.TryWrite(line);
+                    if(!_passwords.Writer.TryWrite(line))
+                    {
+                        await _passwords.Writer.WriteAsync(line).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
-                    AnsiConsole.MarkupLine($"[yellow]Invalid password \"{line}\" at line {linenum}[/].");
+                    AnsiConsole.MarkupLine($"[yellow]Invalid password \"{line.EscapeMarkup()}\" at line {linenum}[/].");
                 }
 
                 linenum++;
