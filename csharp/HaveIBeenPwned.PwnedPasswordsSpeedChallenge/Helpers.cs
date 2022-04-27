@@ -46,7 +46,7 @@ namespace HaveIBeenPwned.PwnedPasswordsSpeedChallenge
         }
 
         [SkipLocalsInit]
-        internal unsafe static void GetSha1Hash(this string password, Memory<byte> hashBytes)
+        internal static unsafe void GetSha1Hash(this string password, Memory<byte> hashBytes)
         {
             Span<byte> workSpan = stackalloc byte[1024];
             SHA1.HashData(workSpan.Slice(0, s_encoding.GetBytes(password, workSpan)), hashBytes.Span);
@@ -124,12 +124,7 @@ namespace HaveIBeenPwned.PwnedPasswordsSpeedChallenge
         {
             if (previousTask.IsCompleted && state is PipeWriter pipeWriter)
             {
-                var flushTask = pipeWriter.FlushAsync();
-                if (!flushTask.IsCompletedSuccessfully)
-                {
-                    await flushTask.ConfigureAwait(false);
-                }
-
+                await pipeWriter.FlushAsync().ConfigureAwait(false);
                 await pipeWriter.CompleteAsync().ConfigureAwait(false);
             }
         }

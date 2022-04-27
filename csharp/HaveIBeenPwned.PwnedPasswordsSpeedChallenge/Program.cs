@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -12,6 +13,10 @@ using System.Threading.Channels;
 using HaveIBeenPwned.PwnedPasswordsSpeedChallenge;
 
 using Microsoft.Win32.SafeHandles;
+
+using Polly;
+using Polly.Extensions.Http;
+using Polly.Retry;
 
 using Spectre.Console;
 using Spectre.Console.Cli;
@@ -54,8 +59,10 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
     internal string _cacheDir = Path.Combine(Environment.CurrentDirectory, "cache");
     internal static Encoding s_encoding = Encoding.UTF8;
     internal HttpClient _httpClient = InitializeHttpClient();
-    internal AsyncDuplicateLock _duplicateLock = new();
     internal ConcurrentStack<List<HashEntry>> _hashEntries = new();
+    internal SemaphoreSlim[] _semaphores = new SemaphoreSlim[256*256];
+    internal AsyncRetryPolicy<HttpResponseMessage> _policy = HttpPolicyExtensions.HandleTransientHttpError().RetryAsync(5);
+    internal ArrayPool<byte> _pool = ArrayPool<byte>.Create();
 
     public sealed class Settings : CommandSettings
     {
@@ -94,6 +101,10 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
         _passwords = Channel.CreateBounded<string>(new BoundedChannelOptions(settings.Parallelism * 16) { SingleReader = false, SingleWriter = true });
         _results = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+        for(int i = 0; i < _semaphores.Length; i++)
+        {
+            _semaphores[i] = new SemaphoreSlim(1);
+        }
 
         InitializeCache(settings);
 
@@ -184,10 +195,9 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
         if (handler.SupportsAutomaticDecompression)
         {
             handler.AutomaticDecompression = DecompressionMethods.All;
-            handler.SslProtocols = System.Security.Authentication.SslProtocols.Tls13;
         }
 
-        HttpClient client = new(handler) { BaseAddress = new Uri("https://api.pwnedpasswords.com/range/"), DefaultRequestVersion = HttpVersion.Version30 };
+        HttpClient client = new(handler) { BaseAddress = new Uri("https://api.pwnedpasswords.com/range/"), DefaultRequestVersion = HttpVersion.Version20 };
         string? process = Environment.ProcessPath;
         if (process != null)
         {
@@ -206,24 +216,19 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
                 File.Delete(outputFile);
             }
 
-            byte[] array = ArrayPool<byte>.Shared.Rent(16384);
+            byte[] array = _pool.Rent(16384);
             Memory<byte> memory = array.AsMemory(0, 16384);
             using SafeFileHandle handle = File.OpenHandle(outputFile, FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous);
             int offset = 0;
             while (await _results.Reader.WaitToReadAsync().ConfigureAwait(false))
             {
                 int totalBytes = 0;
-                while (_results.Reader.TryRead(out string line))
+                while (_results.Reader.TryRead(out string? line) && line is not null)
                 {
                     int byteCount = s_encoding.GetByteCount(line) + 2;
                     if ((totalBytes + byteCount) > memory.Length)
                     {
-                        ValueTask writeTask = RandomAccess.WriteAsync(handle, memory.Slice(0, totalBytes), offset);
-                        if(!writeTask.IsCompletedSuccessfully)
-                        {
-                            await writeTask.ConfigureAwait(false);
-                        }
-
+                        await RandomAccess.WriteAsync(handle, memory.Slice(0, totalBytes), offset).ConfigureAwait(false);
                         offset += totalBytes;
                         totalBytes = 0;
                     }
@@ -237,17 +242,12 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
                 if (totalBytes > 0)
                 {
-                    ValueTask writeTask = RandomAccess.WriteAsync(handle, memory.Slice(0, totalBytes), offset);
-                    if (!writeTask.IsCompletedSuccessfully)
-                    {
-                        await writeTask.ConfigureAwait(false);
-                    }
-
+                    await RandomAccess.WriteAsync(handle, memory.Slice(0, totalBytes), offset).ConfigureAwait(false);
                     offset += totalBytes;
                 }
             }
 
-            ArrayPool<byte>.Shared.Return(array);
+            _pool.Return(array);
         }
     }
 
@@ -255,7 +255,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
     {
         if (_passwords != null && _results != null)
         {
-            byte[] hashBytes = ArrayPool<byte>.Shared.Rent(20);
+            byte[] hashBytes = _pool.Rent(20);
             Memory<byte> hashMemory = hashBytes.AsMemory(0, 20);
 
             while (await _passwords.Reader.WaitToReadAsync().ConfigureAwait(false))
@@ -279,7 +279,7 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
                 }
             }
 
-            ArrayPool<byte>.Shared.Return(hashBytes);
+            _pool.Return(hashBytes);
         }
     }
 
@@ -294,54 +294,51 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
         string prefix = Convert.ToHexString(hash.Span[..3])[..5];
         string prefixFile = Path.Combine(_cacheDir, $"{prefix}.txt");
-
-        using (await AsyncDuplicateLock.LockAsync(string.Intern(prefix)).ConfigureAwait(false))
+        ushort semaphoreIndex = BinaryPrimitives.ReadUInt16BigEndian(hash.Span);
+        SemaphoreSlim semaphore = _semaphores[semaphoreIndex];
+        await semaphore.WaitAsync().ConfigureAwait(false); // Let's lock on the first byte of the prefix
+        byte[]? tempArray = null;
+        try
         {
-            try
+            using SafeFileHandle? handle = File.OpenHandle(prefixFile, FileMode.Open, FileAccess.Read, FileShare.Read, FileOptions.SequentialScan | FileOptions.Asynchronous);
+            int numEntries = (int)RandomAccess.GetLength(handle) / 22;
+            tempArray = _pool.Rent(numEntries * 22);
+            Memory<byte> tempMemory = tempArray.AsMemory(0, numEntries * 22);
+            await RandomAccess.ReadAsync(handle, tempMemory, 0).ConfigureAwait(false);
+
+            for (int i = 0; i < numEntries; i++)
             {
-                using SafeFileHandle? handle = File.OpenHandle(prefixFile, FileMode.Open, FileAccess.Read, FileShare.Read, FileOptions.SequentialScan | FileOptions.Asynchronous);
-                int numEntries = (int)RandomAccess.GetLength(handle) / 22;
-                byte[] tempArray = ArrayPool<byte>.Shared.Rent(numEntries * 22);
-                Memory<byte> tempMemory = tempArray.AsMemory(0, numEntries * 22);
-                ValueTask<int> readTask = RandomAccess.ReadAsync(handle, tempMemory, 0);
-                if (!readTask.IsCompletedSuccessfully)
+                int index = i * 22;
+                if (HashEntry.TryRead(tempMemory.Span.Slice(index, 22), out HashEntry entry))
                 {
-                    await readTask.ConfigureAwait(false);
+                    entries.Add(entry);
                 }
-
-                for (int i = 0; i < numEntries; i++)
-                {
-                    int index = i * 22;
-                    if (HashEntry.TryRead(tempMemory.Span.Slice(index, 22), out HashEntry entry))
-                    {
-                        entries.Add(entry);
-                    }
-                }
-
-                ArrayPool<byte>.Shared.Return(tempArray);
             }
-            catch (FileNotFoundException)
+
+        }
+        catch (FileNotFoundException)
+        {
+            await GetPwnedPasswordsRangeFromWeb(hash, entries).ConfigureAwait(false);
+            int totalBytes = entries.Count * 22;
+            using SafeFileHandle handle = File.OpenHandle(prefixFile, FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous, totalBytes);
+            tempArray = _pool.Rent(totalBytes);
+            Memory<byte> tempMemory = tempArray.AsMemory(0, totalBytes);
+            for (int i = 0; i < entries.Count; i++)
             {
-                await GetPwnedPasswordsRangeFromWeb(hash, entries).ConfigureAwait(false);
-                int totalBytes = entries.Count * 22;
-                using SafeFileHandle handle = File.OpenHandle(prefixFile, FileMode.Create, FileAccess.Write, FileShare.None, FileOptions.Asynchronous, totalBytes);
-                byte[] tempArray = ArrayPool<byte>.Shared.Rent(totalBytes);
-                Memory<byte> tempMemory = tempArray.AsMemory(0, totalBytes);
-                for (int i = 0; i < entries.Count; i++)
-                {
-                    int index = i * 22;
-                    entries[i].TryWrite(tempMemory.Span.Slice(index, 22));
-                }
-
-                ValueTask writeTask = RandomAccess.WriteAsync(handle, tempMemory, 0);
-                if (!writeTask.IsCompletedSuccessfully)
-                {
-                    await writeTask.ConfigureAwait(false);
-                }
-
-
-                ArrayPool<byte>.Shared.Return(tempArray);
+                int index = i * 22;
+                entries[i].TryWrite(tempMemory.Span.Slice(index, 22));
             }
+
+            await RandomAccess.WriteAsync(handle, tempMemory, 0).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (tempArray is not null)
+            {
+                _pool.Return(tempArray);
+            }
+
+            semaphore.Release();
         }
 
         return entries;
@@ -350,10 +347,14 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
     private async Task<List<HashEntry>> GetPwnedPasswordsRangeFromWeb(ReadOnlyMemory<byte> hash, List<HashEntry> items)
     {
         var cloudflareTimer = Stopwatch.StartNew();
-        using var request = new HttpRequestMessage(HttpMethod.Get, Convert.ToHexString(hash[..3].Span)[..5]);
-        using HttpResponseMessage response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+        string requestUri = Convert.ToHexString(hash.Span[..3])[..5];
+        using HttpResponseMessage response = await _policy.ExecuteAsync(() =>
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+            return _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        }).ConfigureAwait(false);
         Stream content = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
-        await ParseHibpEntriesAsync(Convert.ToHexString(hash.Span.Slice(2, 1))[0], content, items).ConfigureAwait(false);
+        await ParseHibpEntriesAsync(requestUri[4], content, items).ConfigureAwait(false);
         Interlocked.Add(ref _statistics.CloudflareRequestTimeTotal, cloudflareTimer.ElapsedMilliseconds);
         Interlocked.Increment(ref _statistics.CloudflareRequests);
         if (response.Headers.TryGetValues("CF-Cache-Status", out IEnumerable<string>? values) && values != null)
@@ -387,19 +388,13 @@ internal sealed class PwnedPasswordsCommand : Command<PwnedPasswordsCommand.Sett
 
     private static async Task<List<HashEntry>> ParseHibpEntriesAsync(char firstChar, Stream stream, List<HashEntry> entries)
     {
-        char[] charArray = ArrayPool<char>.Shared.Rent(64);
-        Memory<char> chars = charArray.AsMemory(0, 64);
-        chars.Span[0] = firstChar;
         await foreach (string item in stream.ParseLinesAsync().ConfigureAwait(false))
         {
-            item.CopyTo(chars.Span.Slice(1));
-            if (HashEntry.TryParse(chars.Span.Slice(0, item.Length + 1), out HashEntry entry))
+            if (HashEntry.TryParse(firstChar, item, out HashEntry entry))
             {
                 entries.Add(entry);
             }
         }
-
-        ArrayPool<char>.Shared.Return(charArray);
 
         return entries;
     }

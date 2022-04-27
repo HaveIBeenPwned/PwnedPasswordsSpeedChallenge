@@ -66,20 +66,32 @@ namespace HaveIBeenPwned.PwnedPasswordsSpeedChallenge
             return true;
         }
 
-        internal static bool TryParse(ReadOnlySpan<char> chars, out HashEntry entry)
+        internal static bool TryParse(char firstChar, ReadOnlySpan<char> chars, out HashEntry entry)
         {
-            if (chars.Length >= 37)
+            if (chars.Length >= 36)
             {
                 int colonIndex = chars.IndexOf(':');
-                if (colonIndex == 36)
+                if (colonIndex == 35)
                 {
                     Span<byte> hashBytes = stackalloc byte[18];
-
-                    for (int i = 0; i < 18; i++)
-                    {
-                        hashBytes[i] = (byte)((HexCharToByte(chars[i * 2]) << 4) | HexCharToByte(chars[i * 2 + 1]));
-                    }
-
+                    hashBytes[0] = (byte)((HexCharToByte(firstChar) << 4) | HexCharToByte(chars[0]));
+                    hashBytes[1] = (byte)((HexCharToByte(chars[1]) << 4) | HexCharToByte(chars[2]));
+                    hashBytes[2] = (byte)((HexCharToByte(chars[3]) << 4) | HexCharToByte(chars[4]));
+                    hashBytes[3] = (byte)((HexCharToByte(chars[5]) << 4) | HexCharToByte(chars[6]));
+                    hashBytes[4] = (byte)((HexCharToByte(chars[7]) << 4) | HexCharToByte(chars[8]));
+                    hashBytes[5] = (byte)((HexCharToByte(chars[9]) << 4) | HexCharToByte(chars[10]));
+                    hashBytes[6] = (byte)((HexCharToByte(chars[11]) << 4) | HexCharToByte(chars[12]));
+                    hashBytes[7] = (byte)((HexCharToByte(chars[13]) << 4) | HexCharToByte(chars[14]));
+                    hashBytes[8] = (byte)((HexCharToByte(chars[15]) << 4) | HexCharToByte(chars[16]));
+                    hashBytes[9] = (byte)((HexCharToByte(chars[17]) << 4) | HexCharToByte(chars[18]));
+                    hashBytes[10] = (byte)((HexCharToByte(chars[19]) << 4) | HexCharToByte(chars[20]));
+                    hashBytes[11] = (byte)((HexCharToByte(chars[21]) << 4) | HexCharToByte(chars[22]));
+                    hashBytes[12] = (byte)((HexCharToByte(chars[23]) << 4) | HexCharToByte(chars[24]));
+                    hashBytes[13] = (byte)((HexCharToByte(chars[25]) << 4) | HexCharToByte(chars[26]));
+                    hashBytes[14] = (byte)((HexCharToByte(chars[27]) << 4) | HexCharToByte(chars[28]));
+                    hashBytes[15] = (byte)((HexCharToByte(chars[29]) << 4) | HexCharToByte(chars[30]));
+                    hashBytes[16] = (byte)((HexCharToByte(chars[31]) << 4) | HexCharToByte(chars[32]));
+                    hashBytes[17] = (byte)((HexCharToByte(chars[33]) << 4) | HexCharToByte(chars[34]));
                     if (int.TryParse(chars.Slice(colonIndex+1), out int prevalence))
                     {
                         entry = new HashEntry(hashBytes, prevalence);
