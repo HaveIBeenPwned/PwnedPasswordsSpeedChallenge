@@ -1,0 +1,13 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterEnum: true
+  AfterStruct: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterControlStatement: Always
+  BeforeElse: true
+  BeforeLambdaBody: true
+  SplitEmptyFunction: false
+
